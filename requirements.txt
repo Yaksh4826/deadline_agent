@@ -1,0 +1,7 @@
+crewai[litellm]
+python-dotenv
+requests
+icalendar
+python-dateutil
+twilio
+google-genai
