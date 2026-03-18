@@ -7,8 +7,6 @@ from dateutil import tz
 import os
 from dotenv import load_dotenv
 from twilio.rest import Client
-from google import genai
-from google.genai import types
 
 load_dotenv()
 
@@ -17,100 +15,324 @@ class _FetchArgs(BaseModel):
     dummy: str = Field(default="", description="Unused")
 
 
+def _parse_dt(dt_obj):
+    """Normalize ical datetime to naive datetime in Toronto timezone."""
+    if not dt_obj or not hasattr(dt_obj, 'dt'):
+        return None
+    dt = dt_obj.dt
+    if isinstance(dt, datetime):
+        if dt.tzinfo:
+            dt = dt.astimezone(tz.gettz("America/Toronto")).replace(tzinfo=None)
+        return dt
+    return None
+
+
 class FetchCalendarDeadlinesTool(BaseTool):
     name: str = "fetch_calendar_deadlines"
-    description: str = "Fetches and parses upcoming deadlines from Centennial Luminate .ics feed. Returns a clean list of upcoming assignments/projects/quizzes with days left."
+    description: str = "Fetches and parses Centennial Luminate .ics feed. Returns structured JSON with classes (name, time, room), assignments (title, due date), and exams."
     args_schema: type[BaseModel] = _FetchArgs
 
     def _run(self, **kwargs) -> str:
+        import json
         try:
             ics_url = os.getenv("ICS_URL")
             if not ics_url:
-                return "Error: ICS_URL not found in .env file"
+                return json.dumps({"error": "ICS_URL not found in .env file"})
             response = requests.get(ics_url, timeout=15)
             response.raise_for_status()
             cal = Calendar.from_ical(response.content)
             now = datetime.now(tz.tzlocal()).replace(tzinfo=None)
-            deadlines = []
+            today = now.date()
+
+            classes_today = []
+            assignments = []
+            exams = []
+
             for event in cal.walk("VEVENT"):
                 summary = str(event.get("summary", "No title")).strip()
-                due_dt = event.get("due") or event.get("dtstart") or event.get("dtend")
-                if not due_dt or not hasattr(due_dt, 'dt'):
-                    continue
-                due = due_dt.dt
-                if isinstance(due, datetime):
-                    if due.tzinfo:
-                        due = due.astimezone(tz.gettz("America/Toronto")).replace(tzinfo=None)
+                parts = summary.split(" -- ") if " -- " in summary else summary.split(" - ", 1)
+                course = parts[0].strip() if parts else "Unknown Course"
+                title = parts[1].strip() if len(parts) > 1 else summary
+                location = str(event.get("location", "") or "").strip()
+                room = location if location else "TBA"
+
+                dtstart = _parse_dt(event.get("dtstart"))
+                dtend = _parse_dt(event.get("dtend"))
+                due_dt = _parse_dt(event.get("due"))
+
+                is_exam = "exam" in summary.lower() or "final" in summary.lower()
+
+                due = due_dt or (dtend if not dtstart else None)
+                if due:
+                    if due <= now:
+                        continue
+                    days_left = (due.date() - today).days
+                    if days_left > 30:
+                        continue
+                    hrs_left = (due - now).total_seconds() / 3600
+                    item = {
+                        "course": course,
+                        "title": title,
+                        "due_date": due.strftime("%b %d, %Y"),
+                        "due_time": due.strftime("%I:%M %p"),
+                        "due_datetime": due.strftime("%b %d %I:%M %p"),
+                        "days_left": days_left,
+                        "urgent": hrs_left <= 24,
+                    }
+                    if is_exam:
+                        exams.append(item)
                     else:
-                        due = due
-                if due <= now:
-                    continue
-                days_left = (due.date() - now.date()).days
-                if days_left > 30:
-                    continue
-                course = summary.split(" -- ")[0].strip() if " -- " in summary else "Centennial Course"
-                deadlines.append(f"- {summary} ({course}) — due {due.strftime('%b %d %I:%M %p')} ({days_left} days left)")
-            if not deadlines:
-                return "No upcoming deadlines in the next 30 days."
-            return "\n".join(deadlines[:12])
+                        assignments.append(item)
+
+                if dtstart and dtend and dtstart.date() == today and not due_dt:
+                    start_str = dtstart.strftime("%I:%M %p").lstrip("0").replace(" 0", " ")
+                    end_str = dtend.strftime("%I:%M %p").lstrip("0").replace(" 0", " ")
+                    short_code = course.split("_")[0][:8] if "_" in course else course[:10]
+                    display_name = f"{title} ({short_code})" if title != summary else course
+                    classes_today.append({
+                        "course": course,
+                        "title": title,
+                        "display_name": display_name,
+                        "start_time": start_str,
+                        "end_time": end_str,
+                        "class_date": today.isoformat(),
+                        "room": room,
+                        "_sort": dtstart,
+                    })
+
+            assignments.sort(key=lambda x: (x["days_left"], x["due_datetime"]))
+            exams.sort(key=lambda x: (x["days_left"], x["due_datetime"]))
+            classes_today.sort(key=lambda x: x["_sort"])
+            for c in classes_today:
+                del c["_sort"]
+
+            assignments_3d = [a for a in assignments if a["days_left"] <= 3][:15]
+            exams_3d = [e for e in exams if e["days_left"] <= 3][:10]
+
+            data = {
+                "classes_today": classes_today,
+                "assignments_due_soon": assignments_3d,
+                "exams": exams_3d,
+                "date": today.strftime("%A, %B %d, %Y"),
+                "date_iso": today.isoformat(),
+            }
+            return json.dumps(data, indent=2)
         except Exception as e:
-            return f"Error fetching calendar: {str(e)}"
+            return json.dumps({"error": str(e)})
 
 
 fetch_calendar_deadlines = FetchCalendarDeadlinesTool()
 
-@tool("plan_daily_tasks")
-def plan_daily_tasks(deadlines: str) -> str:
-    """Creates a realistic daily schedule for Yaksh taking into account his 2-hour commute each way (4h total travel)."""
+
+def _parse_time_to_minutes(s: str) -> int:
+    from datetime import datetime as dt
     try:
-        today = datetime.now().strftime("%A, %B %d, %Y")
-        
-        prompt = f"""You are Yaksh's realistic Centennial College coach in Toronto.
+        t = dt.strptime(str(s).strip().replace(" ", ""), "%I:%M%p")
+        return t.hour * 60 + t.minute
+    except Exception:
+        return 0
 
-Today is {today}.
-Commute: **2 hours each way** (total ~4 hours travel daily on class days) using TTC/GO — include 15–30 min buffer for delays.
-Classes usually ~9 AM – 4–6 PM, but focus on fitting deadlines.
 
-Upcoming deadlines:
-{deadlines}
+def _minutes_to_str(m: int) -> str:
+    h, mn = divmod(m, 60)
+    suf = "PM" if h >= 12 else "AM"
+    if h > 12:
+        h -= 12
+    elif h == 0:
+        h = 12
+    return f"{h}:{mn:02d} {suf}"
 
-Rules for TODAY-ONLY schedule:
-- Wake up 5:30–6:30 AM range
-- Morning commute: leave ~6:30–7:30 AM → arrive 9–10 AM
-- College time: short study blocks between classes
-- Evening commute: leave ~4–7 PM → home 6–9 PM
-- Evening study: only 1–2 hours max if very urgent (fatigue after travel)
-- Include: meals, short walk/exercise, 10–15 min breaks, wind-down
-- Max 5–6 hours focused work
-- Prioritize 1–3 day deadlines
-- Use exact times (e.g. 06:15 AM, 07:45–09:45 commute)
-- End with one short motivational sentence
 
-Return ONLY bullet points. No extra explanation."""
+@tool("plan_daily_tasks")
+def plan_daily_tasks(structured_data: str) -> str:
+    """Builds a structured daily plan from calendar data (pure Python, no LLM)."""
+    import json
+    try:
+        data = json.loads(structured_data)
+        if "error" in data:
+            return data["error"]
 
-        # Gemini API (uses GEMINI_API_KEY or GOOGLE_API_KEY from .env)
-        api_key = os.getenv("GEMINI_API_KEY") or os.getenv("GOOGLE_API_KEY")
-        if not api_key:
-            return "Error: GEMINI_API_KEY or GOOGLE_API_KEY not found in .env file"
+        today_str = data.get("date", datetime.now().strftime("%A, %B %d, %Y"))
+        today_iso = data.get("date_iso", datetime.now(tz.tzlocal()).date().isoformat())
+        classes = [c for c in data.get("classes_today", []) if c.get("class_date", today_iso) == today_iso]
+        assignments = data.get("assignments_due_soon", [])
+        exams = data.get("exams", [])
+        all_due = assignments + exams
 
-        client = genai.Client(api_key=api_key)
-        response = client.models.generate_content(
-            model="gemini-2.5-flash",
-            contents=prompt,
-            config=types.GenerateContentConfig(
-                temperature=0.65,
-                max_output_tokens=750,
-            ),
-        )
-        return response.text.strip() if response.text else "Error: No response from Gemini"
-    
+        sorted_classes = sorted(classes, key=lambda c: _parse_time_to_minutes(c.get("start_time", "")) or 9999) if classes else []
+
+        commute_mins = 120
+        buffer_mins = 15
+
+        if sorted_classes:
+            first_start = _parse_time_to_minutes(sorted_classes[0].get("start_time", "")) or (10 * 60)
+            last_end = _parse_time_to_minutes(sorted_classes[-1].get("end_time", "")) or (12 * 60)
+            depart_to_campus = first_start - commute_mins
+            arrive_campus = first_start - buffer_mins
+            depart_from_campus = last_end + buffer_mins
+            arrive_home = depart_from_campus + commute_mins
+            wake_up = 10 * 60 if first_start >= 14 * 60 else max(6 * 60, depart_to_campus - 90)
+        else:
+            first_start = 10 * 60
+            last_end = 12 * 60
+            depart_to_campus = 8 * 60 + 30
+            arrive_campus = 10 * 60 + 30
+            depart_from_campus = 16 * 60
+            arrive_home = 18 * 60
+            wake_up = 6 * 60
+
+        study_duration = 60
+        slots = []
+        if sorted_classes:
+            if first_start > arrive_campus + 30:
+                slots.append((arrive_campus + 30, first_start - 15))
+            for i in range(len(sorted_classes) - 1):
+                end_m = _parse_time_to_minutes(sorted_classes[i].get("end_time", ""))
+                next_start = _parse_time_to_minutes(sorted_classes[i + 1].get("start_time", ""))
+                if next_start - end_m >= 45:
+                    slots.append((end_m + 15, next_start - 15))
+            if depart_from_campus - last_end >= 45:
+                slots.append((last_end + 15, depart_from_campus - 15))
+        else:
+            slots.append((arrive_campus + 30, depart_from_campus - 30))
+        slots.append((arrive_home + 30, 21 * 60))
+
+        study_items = [{"course": a["course"], "title": a["title"], "urgent": a.get("urgent", False), "days_left": a.get("days_left", 99)} for a in all_due]
+        study_items.sort(key=lambda x: (not x["urgent"], x["days_left"]))
+
+        study_blocks = []
+        block_idx = 0
+        for slot_start, slot_end in slots:
+            available = slot_end - slot_start
+            if available < 30:
+                continue
+            while block_idx < len(study_items) and available >= study_duration:
+                item = study_items[block_idx]
+                block_idx += 1
+                study_blocks.append({
+                    "start": _minutes_to_str(slot_start),
+                    "end": _minutes_to_str(slot_start + study_duration),
+                    "course": item["course"],
+                    "title": item["title"],
+                })
+                slot_start += study_duration
+                available -= study_duration
+
+        if not study_blocks and all_due:
+            for item in study_items[:5]:
+                study_blocks.append({
+                    "start": "",
+                    "end": "",
+                    "course": item["course"],
+                    "title": item["title"],
+                })
+
+        structured_plan = {
+            "date": today_str,
+            "wake_up": _minutes_to_str(wake_up),
+            "commute_to_campus": {
+                "depart": _minutes_to_str(depart_to_campus),
+                "arrive": _minutes_to_str(arrive_campus),
+            },
+            "commute_home": {
+                "depart": _minutes_to_str(depart_from_campus),
+                "arrive": _minutes_to_str(arrive_home),
+            },
+            "classes": [
+                {
+                    "start_time": c.get("start_time", ""),
+                    "display_name": c.get("display_name", c.get("title", c.get("course", "?"))),
+                    "room": c.get("room", "TBA"),
+                }
+                for c in sorted_classes
+            ],
+            "due_soon": [
+                {
+                    "due_datetime": item.get("due_datetime", ""),
+                    "course": item.get("course", "?"),
+                    "title": item.get("title", "?"),
+                    "urgent": bool(item.get("urgent", False)),
+                }
+                for item in all_due
+            ],
+            "study_blocks": study_blocks,
+        }
+        return json.dumps(structured_plan, indent=2)
+
+    except json.JSONDecodeError as e:
+        return f"Error parsing calendar data: {str(e)}"
     except Exception as e:
         return f"Error generating plan: {str(e)}"
-    
+
+
+@tool("format_plan")
+def format_plan(structured_plan: str) -> str:
+    """Formats structured plan JSON into WhatsApp-friendly message (pure Python)."""
+    import json
+    try:
+        data = json.loads(structured_plan)
+        if "error" in data:
+            return data["error"]
+
+        first_class_min = _parse_time_to_minutes(data.get("classes", [{}])[0].get("start_time", "")) if data.get("classes") else 0
+        start_label = "☀️ *Morning*" if first_class_min and first_class_min < 12 * 60 else "📅 *Before class*"
+
+        lines = [
+            f"📅 *Plan for {data.get('date', '')}*",
+            "",
+            start_label,
+            f"• {data.get('wake_up', '')} – Wake up",
+            f"• {data.get('commute_to_campus', {}).get('depart', '')} – {data.get('commute_to_campus', {}).get('arrive', '')} – *🚌 Commute to campus (2h)*",
+            "",
+            "🏫 *CLASSES TODAY*",
+        ]
+
+        classes = data.get("classes", [])
+        if not classes:
+            lines.append("• No classes today 🎉")
+        else:
+            for c in classes:
+                lines.append(f"• {c.get('start_time', '')} – {c.get('display_name', '?')} 📍 Room {c.get('room', 'TBA')}")
+
+        lines.extend([
+            "",
+            "🌆 *Evening*",
+            f"• {data.get('commute_home', {}).get('depart', '')} – {data.get('commute_home', {}).get('arrive', '')} – *🚌 Commute home (2h)*",
+            "",
+            "📝 *DUE SOON*",
+        ])
+
+        due_items = data.get("due_soon", [])
+        if not due_items:
+            lines.append("• Nothing due in next 3 days ✅")
+        else:
+            for item in due_items:
+                urgent = " ⚠️ *URGENT*" if item.get("urgent") else ""
+                lines.append(f"• 📌 {item.get('due_datetime', '')}: {item.get('course', '?')} – {item.get('title', '?')}{urgent}")
+
+        lines.extend(["", "⏰ *STUDY BLOCKS*"])
+        blocks = data.get("study_blocks", [])
+        if not blocks:
+            lines.append("• No study blocks needed today")
+        else:
+            for block in blocks:
+                if block.get("start") and block.get("end"):
+                    lines.append(f"• 📚 {block.get('start')} – {block.get('end')} → {block.get('course', '?')} – {block.get('title', '?')}")
+                else:
+                    lines.append(f"• 📚 {block.get('course', '?')} – {block.get('title', '?')}")
+
+        lines.extend(["", "💪 *You got this!*"])
+        # Avoid JSON-unsafe escaping in downstream LLM tool calls.
+        return "\n".join(lines).replace("'", "’")
+    except Exception as e:
+        return f"Error formatting plan: {str(e)}"
+
+
 @tool("send_whatsapp_plan")
 def send_whatsapp_plan(plan_text: str) -> str:
     """Sends the daily study plan to Yaksh's WhatsApp via Twilio."""
     try:
+        import json
         account_sid = os.getenv("TWILIO_ACCOUNT_SID")
         auth_token = os.getenv("TWILIO_AUTH_TOKEN")
         from_number = os.getenv("TWILIO_WHATSAPP_FROM")
@@ -120,9 +342,19 @@ def send_whatsapp_plan(plan_text: str) -> str:
             return "Error: Missing Twilio credentials in .env"
 
         client = Client(account_sid, auth_token)
+
+        # Some model tool-calls pass escaped unicode/newlines as raw text.
+        # Normalize so WhatsApp receives real emojis and line breaks.
+        normalized_text = plan_text
+        if "\\u" in normalized_text or "\\n" in normalized_text:
+            try:
+                escaped = normalized_text.replace("\\", "\\\\").replace('"', '\\"')
+                normalized_text = json.loads('"' + escaped + '"')
+            except Exception:
+                normalized_text = normalized_text.replace("\\n", "\n")
         
         message = client.messages.create(
-            body=f"📅 Centennial Daily Plan\n\n{plan_text}\n\nYou've got this! 💪",
+            body=normalized_text,
             from_=from_number,
             to=to_number
         )

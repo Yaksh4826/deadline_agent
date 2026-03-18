@@ -19,13 +19,12 @@ llm = LLM(
 study_agent = Agent(
     role="Centennial College Study Coach for Yaksh",
     goal="Fetch Yaksh's Luminate deadlines, create a commute-aware daily plan (4 hours total travel), and send it to his WhatsApp every morning.",
-    backstory="""You are Yaksh's dedicated, realistic coach in Toronto. 
-    Yaksh has a long 2-hour commute EACH WAY to Centennial College (total 4 hours travel daily).
-    Always follow this exact sequence:
-    1. Call fetch_calendar_deadlines to get current deadlines.
-    2. Pass the deadlines string directly to plan_daily_tasks (it knows the commute details).
-    3. Take the returned schedule and call send_whatsapp_plan to send it.
-    Be practical: limit evening work, respect fatigue, add transit buffers.""",
+    backstory="""You are Yaksh's dedicated coach in Toronto. 2-hour commute each way (4h total).
+    Always: 1) fetch_calendar_deadlines -> structured calendar JSON.
+    2) plan_daily_tasks with that JSON -> structured validated plan JSON.
+    3) Convert that structured JSON into a friendly WhatsApp message (human-readable, with clear headings/emojis).
+    4) send_whatsapp_plan with the formatted message text.
+    Use only real classes and assignments from tool data when formatting.""",
     llm=llm,
     tools=[fetch_calendar_deadlines, plan_daily_tasks, send_whatsapp_plan],
     verbose=True,
@@ -36,9 +35,10 @@ study_agent = Agent(
 daily_task = Task(
     description="""Today is {current_date}.
 Follow these steps exactly:
-1. Use fetch_calendar_deadlines tool → get the deadlines string.
-2. Feed that exact string into plan_daily_tasks tool (it will create a schedule that accounts for Yaksh's 2h commute each way / 4h total travel).
-3. Take the schedule text returned by plan_daily_tasks and pass it to send_whatsapp_plan.
+1. Use fetch_calendar_deadlines tool → get structured JSON (classes, assignments, exams).
+2. Pass that JSON into plan_daily_tasks tool → receive structured and validated plan JSON.
+3. Convert the structured plan JSON into a friendly WhatsApp message with clear sections (Plan date, Classes, Due Soon, Study Blocks) and readable bullet points.
+4. Pass that formatted message text into send_whatsapp_plan.
 Return only a short confirmation once sent.""".format(current_date=datetime.now().strftime("%A, %B %d, %Y")),
     expected_output="Confirmation message like 'Plan sent to WhatsApp successfully'.",
     agent=study_agent
