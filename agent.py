@@ -1,7 +1,7 @@
 from crewai import Agent, Task, Crew, LLM
 from dotenv import load_dotenv
 import os
-from tools import fetch_calendar_deadlines, plan_daily_tasks, send_whatsapp_plan
+from tools import fetch_calendar_deadlines, plan_daily_tasks, format_plan, send_whatsapp_plan
 from datetime import datetime
 
 load_dotenv()
@@ -13,20 +13,21 @@ if not groq_api_key:
 llm = LLM(
     model="groq/llama-3.3-70b-versatile",
     api_key=groq_api_key,
-    temperature=0.7,
+    temperature=0.0,
 )
 
 study_agent = Agent(
     role="Centennial College Study Coach for Yaksh",
     goal="Fetch Yaksh's Luminate deadlines, create a commute-aware daily plan (4 hours total travel), and send it to his WhatsApp every morning.",
     backstory="""You are Yaksh's dedicated coach in Toronto. 2-hour commute each way (4h total).
-    Always: 1) fetch_calendar_deadlines -> structured calendar JSON.
-    2) plan_daily_tasks with that JSON -> structured validated plan JSON.
-    3) Convert that structured JSON into a friendly WhatsApp message (human-readable, with clear headings/emojis).
-    4) send_whatsapp_plan with the formatted message text.
-    Use only real classes and assignments from tool data when formatting.""",
+    Always follow deterministic tool-only flow:
+    1) fetch_calendar_deadlines -> structured calendar JSON
+    2) plan_daily_tasks with that JSON -> structured validated plan JSON
+    3) format_plan with that structured plan JSON -> friendly WhatsApp text with emojis
+    4) send_whatsapp_plan with the formatted text
+    Do not invent classes/assignments; use only tool outputs.""",
     llm=llm,
-    tools=[fetch_calendar_deadlines, plan_daily_tasks, send_whatsapp_plan],
+    tools=[fetch_calendar_deadlines, plan_daily_tasks, format_plan, send_whatsapp_plan],
     verbose=True,
     allow_delegation=False,
     memory=False
@@ -37,8 +38,8 @@ daily_task = Task(
 Follow these steps exactly:
 1. Use fetch_calendar_deadlines tool → get structured JSON (classes, assignments, exams).
 2. Pass that JSON into plan_daily_tasks tool → receive structured and validated plan JSON.
-3. Convert the structured plan JSON into a friendly WhatsApp message with clear sections (Plan date, Classes, Due Soon, Study Blocks) and readable bullet points.
-4. Pass that formatted message text into send_whatsapp_plan.
+3. Pass the structured plan JSON into format_plan tool → receive friendly formatted message with emojis.
+4. Pass that formatted message into send_whatsapp_plan.
 Return only a short confirmation once sent.""".format(current_date=datetime.now().strftime("%A, %B %d, %Y")),
     expected_output="Confirmation message like 'Plan sent to WhatsApp successfully'.",
     agent=study_agent
