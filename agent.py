@@ -25,7 +25,9 @@ study_agent = Agent(
     2) plan_daily_tasks with that JSON -> structured validated plan JSON
     3) format_plan with that structured plan JSON -> friendly WhatsApp text with emojis
     4) send_whatsapp_plan with the formatted text
-    Do not invent classes/assignments; use only tool outputs.""",
+    Do not invent classes/assignments; use only tool outputs.
+    Never modify, escape, or replace * asterisk characters in tool outputs.
+    Pass tool outputs exactly as returned without any reformatting.""",
     llm=llm,
     tools=[fetch_calendar_deadlines, plan_daily_tasks, format_plan, send_whatsapp_plan],
     verbose=True,

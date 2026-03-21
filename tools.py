@@ -308,13 +308,13 @@ def format_plan(structured_plan: str) -> str:
         classes = data.get("classes", [])
         class_starts = [_parse_time_to_minutes(c.get("start_time", "")) for c in classes if _parse_time_to_minutes(c.get("start_time", "")) > 0]
         if not class_starts:
-            start_label = "🌅 *Today*"
+            start_label = "\U0001F305 *Today*"
         elif any(t < 12 * 60 for t in class_starts):
-            start_label = "☀️ *Morning*"
+            start_label = "\u2600\uFE0F *Morning*"
         else:
-            start_label = "🌆 *Afternoon*"
+            start_label = "\U0001F306 *Afternoon*"
 
-        lines = [f"📅 *Plan for {data.get('date', '')}*", "", start_label]
+        lines = [f"\U0001F4C5 *Plan for {data.get('date', '')}*", "", start_label]
 
         if data.get("wake_up"):
             lines.append(f"• {data.get('wake_up', '')} – Wake up")
@@ -322,34 +322,34 @@ def format_plan(structured_plan: str) -> str:
         if data.get("commute_to_campus") is not None:
             lines.append(
                 f"• {data.get('commute_to_campus', {}).get('depart', '')} – "
-                f"{data.get('commute_to_campus', {}).get('arrive', '')} – *🚌 Commute to campus (2h)*"
+                f"{data.get('commute_to_campus', {}).get('arrive', '')} – *\U0001F68C Commute to campus (2h)*"
             )
 
-        lines.extend(["", "🏫 *CLASSES TODAY*"])
+        lines.extend(["", "\U0001F3EB *CLASSES TODAY*"])
         if not classes:
-            lines.append("• No classes today 🎉")
+            lines.append("• No classes today \U0001F389")
         else:
             for c in classes:
-                lines.append(f"• {c.get('start_time', '')} – {c.get('display_name', '?')} 📍 Room {c.get('room', 'TBA')}")
+                lines.append(f"• {c.get('start_time', '')} – {c.get('display_name', '?')} \U0001F4CC Room {c.get('room', 'TBA')}")
 
         if data.get("commute_home") is not None:
             lines.extend([
                 "",
-                "🌆 *Evening*",
-                f"• {data.get('commute_home', {}).get('depart', '')} – {data.get('commute_home', {}).get('arrive', '')} – *🚌 Commute home (2h)*",
+                "\U0001F306 *Evening*",
+                f"• {data.get('commute_home', {}).get('depart', '')} – {data.get('commute_home', {}).get('arrive', '')} – *\U0001F68C Commute home (2h)*",
             ])
 
-        lines.extend(["", "📝 *DUE SOON*"])
+        lines.extend(["", "\U0001F4DD *DUE SOON*"])
 
         due_items = data.get("due_soon", [])
         if not due_items:
-            lines.append("• Nothing due in next 3 days ✅")
+            lines.append("• Nothing due in next 3 days \u2705")
         else:
             for item in due_items:
-                urgent = " ⚠️ *URGENT*" if item.get("urgent") else ""
-                lines.append(f"• 📌 {item.get('due_datetime', '')}: {item.get('course', '?')} – {item.get('title', '?')}{urgent}")
+                urgent = " \u26A0\uFE0F *URGENT*" if item.get("urgent") else ""
+                lines.append(f"• \U0001F4CC {item.get('due_datetime', '')}: {item.get('course', '?')} – {item.get('title', '?')}{urgent}")
 
-        lines.extend(["", "⏰ *STUDY BLOCKS*"])
+        lines.extend(["", "\u23F0 *STUDY BLOCKS*"])
         blocks = data.get("study_blocks", [])
         if not blocks:
             if due_items:
@@ -362,11 +362,11 @@ def format_plan(structured_plan: str) -> str:
         else:
             for block in blocks:
                 if block.get("start") and block.get("end"):
-                    lines.append(f"• 📚 {block.get('start')} – {block.get('end')} → {block.get('course', '?')} – {block.get('title', '?')}")
+                    lines.append(f"• \U0001F4DA {block.get('start')} – {block.get('end')} → {block.get('course', '?')} – {block.get('title', '?')}")
                 else:
-                    lines.append(f"• 📚 {block.get('course', '?')} – {block.get('title', '?')} (fit in when you can)")
+                    lines.append(f"• \U0001F4DA {block.get('course', '?')} – {block.get('title', '?')} (fit in when you can)")
 
-        lines.extend(["", "💪 *You got this!*"])
+        lines.extend(["", "\U0001F4AA *You got this!*"])
         # Avoid JSON-unsafe escaping in downstream LLM tool calls.
         return "\n".join(lines).replace("'", "’")
     except Exception as e:
@@ -397,6 +397,10 @@ def send_whatsapp_plan(plan_text: str) -> str:
                 normalized_text = json.loads('"' + escaped + '"')
             except Exception:
                 normalized_text = normalized_text.replace("\\n", "\n")
+        normalized_text = normalized_text.replace("⨯⨯", "*")
+        normalized_text = normalized_text.replace("⨯", "*")
+        normalized_text = normalized_text.replace("\u22ef", "*")
+        normalized_text = normalized_text.replace("\u22c6", "*")
         
         message = client.messages.create(
             body=normalized_text,
