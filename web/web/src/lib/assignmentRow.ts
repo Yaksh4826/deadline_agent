@@ -8,6 +8,8 @@ export type AssignmentRow = {
   priority: number | null;
   course_id: number;
   courses: CourseRow | null;
+  /** Present when the row is selected with `updated_at` (e.g. dashboard). */
+  updated_at?: string | null;
 };
 
 function normalizeCourseRelation(
@@ -37,6 +39,7 @@ export function normalizeAssignmentRows(raw: unknown): AssignmentRow[] {
       courses: normalizeCourseRelation(
         r.courses as CourseRow | CourseRow[] | null | undefined,
       ),
+      updated_at: (r.updated_at as string | null | undefined) ?? undefined,
     };
   });
 }
