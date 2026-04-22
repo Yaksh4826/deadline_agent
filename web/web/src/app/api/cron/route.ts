@@ -1,71 +1,38 @@
-import { createClient } from "@supabase/supabase-js";
 import { NextResponse } from "next/server";
+import { normalizeAssignmentRows, type AssignmentRow } from "@/lib/assignmentRow";
+import { getSupabaseForStudyAgent } from "@/lib/studyAgentSupabase";
+import { sendWhatsAppText } from "@/lib/whatsappCloud";
 
 const UPCOMING_DAYS = 14;
 const OVERDUE_LOOKBACK_DAYS = 30;
 const ASSIGNMENT_FETCH_LIMIT = 80;
-const WHATSAPP_MAX_BODY = 4096;
+const VELOCITY_WINDOW_DAYS = 14;
+const PRODUCTIVITY_LOG_CAP = 400;
+const LLM_MAX_OUT_TOKENS = 2500;
 
-type CourseRow = { name: string; code: string | null };
-type AssignmentRow = {
-  id: number;
-  title: string;
-  description: string | null;
-  due_date: string | null;
-  status: string;
-  priority: number | null;
-  course_id: number;
-  courses: CourseRow | null;
+type ProductivityLogRow = {
+  activity_type: string;
+  duration_minutes: number | null;
+  logged_at: string;
+  notes: string | null;
+  assignment_id: number | null;
+  course_id: number | null;
 };
 
-function normalizeCourseRelation(
-  courses: CourseRow | CourseRow[] | null | undefined,
-): CourseRow | null {
-  if (!courses) {
-    return null;
-  }
-  return Array.isArray(courses) ? (courses[0] ?? null) : courses;
-}
-
-function normalizeAssignmentRows(raw: unknown): AssignmentRow[] {
-  if (!Array.isArray(raw)) {
-    return [];
-  }
-
-  return raw.map((row) => {
-    const r = row as Record<string, unknown>;
-    return {
-      id: r.id as number,
-      title: r.title as string,
-      description: (r.description as string | null) ?? null,
-      due_date: (r.due_date as string | null) ?? null,
-      status: r.status as string,
-      priority: (r.priority as number | null) ?? null,
-      course_id: r.course_id as number,
-      courses: normalizeCourseRelation(
-        r.courses as CourseRow | CourseRow[] | null | undefined,
-      ),
-    };
-  });
-}
-
-function getSupabaseForStudyAgent() {
-  const supabaseUrl = process.env.NEXT_PUBLIC_SUPABASE_URL;
-  const serviceRoleKey = process.env.SUPABASE_SERVICE_ROLE_KEY;
-  const schema = process.env.NEXT_PUBLIC_DB_SCHEMA ?? process.env.DB_SCHEMA ?? "study_agent";
-
-  if (!supabaseUrl) {
-    throw new Error("Missing NEXT_PUBLIC_SUPABASE_URL environment variable.");
-  }
-
-  if (!serviceRoleKey) {
-    throw new Error("Missing SUPABASE_SERVICE_ROLE_KEY environment variable.");
-  }
-
-  return createClient(supabaseUrl, serviceRoleKey, {
-    db: { schema },
-  });
-}
+type ProductivityVelocitySnapshot = {
+  windowDays: number;
+  logRowsInWindow: number;
+  totalMinutesLogged: number;
+  avgMinutesPerLog: number | null;
+  minutesPerDayEstimate: number | null;
+  byActivityType: Record<string, { entries: number; minutes: number }>;
+  recentEntries: Array<{
+    logged_at: string;
+    activity_type: string;
+    duration_minutes: number | null;
+    notes: string | null;
+  }>;
+};
 
 function isAuthorized(request: Request) {
   const expected = process.env.CRON_SECRET;
@@ -109,16 +76,118 @@ function filterUpcomingAssignments(rows: AssignmentRow[]): AssignmentRow[] {
   });
 }
 
-function assignmentsToBriefJson(assignments: AssignmentRow[]) {
+/** Full assignment rows as stored / joined (for the agent). */
+function assignmentsToRawPayload(assignments: AssignmentRow[]) {
   return assignments.map((a) => ({
+    id: a.id,
+    course_id: a.course_id,
+    course: a.courses
+      ? { name: a.courses.name, code: a.courses.code }
+      : null,
     title: a.title,
-    course: a.courses?.name ?? `course_id:${a.course_id}`,
-    courseCode: a.courses?.code ?? null,
-    dueDate: a.due_date,
-    priority: a.priority,
+    description: a.description,
+    due_date: a.due_date,
     status: a.status,
-    description: a.description ? a.description.slice(0, 500) : null,
+    priority: a.priority,
   }));
+}
+
+function buildVelocityFromLogs(rows: ProductivityLogRow[]): ProductivityVelocitySnapshot {
+  const byActivityType: Record<string, { entries: number; minutes: number }> = {};
+  let totalMinutesLogged = 0;
+
+  for (const row of rows) {
+    const m = row.duration_minutes ?? 0;
+    totalMinutesLogged += m;
+    const key = row.activity_type || "unknown";
+    if (!byActivityType[key]) {
+      byActivityType[key] = { entries: 0, minutes: 0 };
+    }
+    byActivityType[key].entries += 1;
+    byActivityType[key].minutes += m;
+  }
+
+  const n = rows.length;
+  const avgMinutesPerLog = n > 0 ? totalMinutesLogged / n : null;
+  const minutesPerDayEstimate =
+    VELOCITY_WINDOW_DAYS > 0 ? totalMinutesLogged / VELOCITY_WINDOW_DAYS : null;
+
+  const recentEntries = rows.slice(0, 20).map((r) => ({
+    logged_at: r.logged_at,
+    activity_type: r.activity_type,
+    duration_minutes: r.duration_minutes,
+    notes: r.notes ? r.notes.slice(0, 200) : null,
+  }));
+
+  return {
+    windowDays: VELOCITY_WINDOW_DAYS,
+    logRowsInWindow: n,
+    totalMinutesLogged,
+    avgMinutesPerLog,
+    minutesPerDayEstimate,
+    byActivityType,
+    recentEntries,
+  };
+}
+
+function scheduleTimezone(): string {
+  return process.env.STUDY_SCHEDULE_TZ ?? process.env.WHATSAPP_WEBHOOK_TZ ?? "America/New_York";
+}
+
+function formatTodayInTz(timeZone: string): string {
+  return new Date().toLocaleString("en-US", {
+    timeZone,
+    weekday: "long",
+    year: "numeric",
+    month: "long",
+    day: "numeric",
+  });
+}
+
+function buildAgenticSchedulePrompt(
+  assignments: AssignmentRow[],
+  velocity: ProductivityVelocitySnapshot,
+): { system: string; user: string } {
+  const tz = scheduleTimezone();
+  const todayStr = formatTodayInTz(tz);
+  const rawAssignmentsJson = JSON.stringify(assignmentsToRawPayload(assignments), null, 2);
+  const velocityJson = JSON.stringify(velocity, null, 2);
+
+  const system = `You are a study scheduling agent. You receive structured data from the student's database (assignments + productivity velocity). You must reason about cognitive load and sustainable pacing, then output exactly one plain-text message for WhatsApp: no JSON, no markdown code fences, no XML.`;
+
+  const user = `## Scheduling context
+
+### Today (student timezone: ${tz})
+${todayStr}
+
+### Productivity velocity
+Computed from Supabase table productivity_logs over the last ${velocity.windowDays} days (see fields below). Use minutesPerDayEstimate and recentEntries to calibrate how aggressive today's schedule should be. If logRowsInWindow is 0 or totals are very low, keep the plan gentle and build habits.
+
+${velocityJson}
+
+### Raw assignments (JSON)
+These rows are already filtered to: overdue within ${OVERDUE_LOOKBACK_DAYS} days, due within the next ${UPCOMING_DAYS} days, or no due date; status is not completed. Use ids/titles consistently.
+
+${rawAssignmentsJson}
+
+## What you must produce
+
+1) **Intensity map** — For every assignment in the JSON above, assign exactly one label: **High Intensity** (deep focus: exams, proofs, long writing, hard problem sets, big projects) or **Low Intensity** (readings, flashcards, light review, organization, short quizzes). List under two headings with bullet lines that include assignment id and title.
+
+2) **Today's schedule** — Build a single-day timetable with **specific clock times** (e.g. 9:15–10:45). Include:
+   - Named blocks tied to assignment id or title
+   - **Breaks** after demanding blocks (state duration, e.g. 10 min walk)
+   - A longer break mid-day if the plan spans lunch
+   - Interleave high and low intensity where it aids recovery
+   - Let **productivity velocity** guide total focused minutes: lower recent volume → shorter deep-work stretches; higher volume → you may propose deeper blocks while still including breaks
+
+3) **Closing** — One short encouraging line.
+
+Start the message with the title line: Daily Study Plan
+
+Keep the full message under 3500 characters.`;
+
+  return { system, user };
 }
 
 function fallbackPlan(assignments: AssignmentRow[]): string {
@@ -135,15 +204,11 @@ function fallbackPlan(assignments: AssignmentRow[]): string {
   return ["Daily Study Plan", "", ...lines].join("\n");
 }
 
-async function generateDailyStudyPlanWithLlm(assignments: AssignmentRow[]): Promise<string> {
-  const brief = JSON.stringify(assignmentsToBriefJson(assignments));
-  const userPrompt = `You are helping a student plan their day.
-
-Here are their open assignments as JSON (already filtered to overdue within ${OVERDUE_LOOKBACK_DAYS} days, due in the next ${UPCOMING_DAYS} days, or with no due date):
-
-${brief}
-
-Write a single message titled "Daily Study Plan". Use short sections and bullet points. Prioritize by due date and priority. Suggest realistic time blocks for today. If the list is empty, encourage light review or a stretch goal. Stay under 3500 characters. No markdown code fences.`;
+async function generateAgenticScheduleWithLlm(
+  assignments: AssignmentRow[],
+  velocity: ProductivityVelocitySnapshot,
+): Promise<string> {
+  const { system, user } = buildAgenticSchedulePrompt(assignments, velocity);
 
   const openaiKey = process.env.OPENAI_API_KEY;
   if (openaiKey) {
@@ -156,15 +221,11 @@ Write a single message titled "Daily Study Plan". Use short sections and bullet 
       },
       body: JSON.stringify({
         model,
-        temperature: 0.6,
-        max_tokens: 1400,
+        temperature: 0.55,
+        max_tokens: LLM_MAX_OUT_TOKENS,
         messages: [
-          {
-            role: "system",
-            content:
-              "You write clear, actionable daily study plans. Be concise and supportive. Output plain text suitable for WhatsApp.",
-          },
-          { role: "user", content: userPrompt },
+          { role: "system", content: system },
+          { role: "user", content: user },
         ],
       }),
     });
@@ -195,10 +256,9 @@ Write a single message titled "Daily Study Plan". Use short sections and bullet 
       },
       body: JSON.stringify({
         model,
-        max_tokens: 1400,
-        system:
-          "You write clear, actionable daily study plans. Be concise and supportive. Output plain text suitable for WhatsApp.",
-        messages: [{ role: "user", content: userPrompt }],
+        max_tokens: LLM_MAX_OUT_TOKENS,
+        system,
+        messages: [{ role: "user", content: user }],
       }),
     });
 
@@ -219,77 +279,58 @@ Write a single message titled "Daily Study Plan". Use short sections and bullet 
   throw new Error("Set OPENAI_API_KEY or ANTHROPIC_API_KEY to generate a study plan.");
 }
 
-async function sendWhatsAppDailyPlan(body: string): Promise<{ ok: true } | { ok: false; error: string }> {
-  const token = process.env.WHATSAPP_ACCESS_TOKEN;
-  const phoneNumberId = process.env.WHATSAPP_PHONE_NUMBER_ID;
-  const to = process.env.WHATSAPP_RECIPIENT_PHONE;
-
-  if (!token || !phoneNumberId || !to) {
-    return {
-      ok: false,
-      error:
-        "Missing WHATSAPP_ACCESS_TOKEN, WHATSAPP_PHONE_NUMBER_ID, or WHATSAPP_RECIPIENT_PHONE (WhatsApp Cloud API).",
-    };
-  }
-
-  const version = process.env.WHATSAPP_GRAPH_API_VERSION ?? "v21.0";
-  const url = `https://graph.facebook.com/${version}/${phoneNumberId}/messages`;
-  const normalizedTo = to.replace(/\D/g, "");
-  const textBody =
-    body.length > WHATSAPP_MAX_BODY ? `${body.slice(0, WHATSAPP_MAX_BODY - 1)}…` : body;
-
-  const res = await fetch(url, {
-    method: "POST",
-    headers: {
-      Authorization: `Bearer ${token}`,
-      "Content-Type": "application/json",
-    },
-    body: JSON.stringify({
-      messaging_product: "whatsapp",
-      to: normalizedTo,
-      type: "text",
-      text: { preview_url: false, body: textBody },
-    }),
-  });
-
-  if (!res.ok) {
-    return { ok: false, error: await res.text() };
-  }
-
-  return { ok: true };
-}
-
 async function handleCronRequest(request: Request) {
   if (!isAuthorized(request)) {
     return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
   }
 
   const supabase = getSupabaseForStudyAgent();
+  const since = new Date(Date.now() - VELOCITY_WINDOW_DAYS * 24 * 60 * 60 * 1000).toISOString();
 
-  const { data: rawRows, error } = await supabase
-    .from("assignments")
-    .select("id,title,description,due_date,status,priority,course_id,courses(name,code)")
-    .neq("status", "completed")
-    .order("due_date", { ascending: true, nullsFirst: false })
-    .limit(ASSIGNMENT_FETCH_LIMIT);
+  const [assignRes, logsRes] = await Promise.all([
+    supabase
+      .from("assignments")
+      .select("id,title,description,due_date,status,priority,course_id,courses(name,code)")
+      .neq("status", "completed")
+      .order("due_date", { ascending: true, nullsFirst: false })
+      .limit(ASSIGNMENT_FETCH_LIMIT),
+    supabase
+      .from("productivity_logs")
+      .select("activity_type, duration_minutes, logged_at, notes, assignment_id, course_id")
+      .gte("logged_at", since)
+      .order("logged_at", { ascending: false })
+      .limit(PRODUCTIVITY_LOG_CAP),
+  ]);
 
-  if (error) {
+  if (assignRes.error) {
     return NextResponse.json(
-      { error: "Failed to fetch assignments", details: error.message },
+      { error: "Failed to fetch assignments", details: assignRes.error.message },
       { status: 500 },
     );
   }
 
-  const allFetched = normalizeAssignmentRows(rawRows);
+  if (logsRes.error) {
+    console.error("productivity_logs fetch:", logsRes.error.message);
+  }
+
+  const allFetched = normalizeAssignmentRows(assignRes.data);
   const assignments = filterUpcomingAssignments(allFetched);
+  const velocity = buildVelocityFromLogs((logsRes.data ?? []) as ProductivityLogRow[]);
 
   let plan: string;
   try {
-    plan = await generateDailyStudyPlanWithLlm(assignments);
+    plan = await generateAgenticScheduleWithLlm(assignments, velocity);
   } catch (e) {
     plan = fallbackPlan(assignments);
     const message = e instanceof Error ? e.message : String(e);
-    const whatsappResult = await sendWhatsAppDailyPlan(plan);
+    const to = process.env.WHATSAPP_RECIPIENT_PHONE;
+    if (!to) {
+      return NextResponse.json(
+        { ok: false, error: "Missing WHATSAPP_RECIPIENT_PHONE", llmError: message },
+        { status: 500 },
+      );
+    }
+    const whatsappResult = await sendWhatsAppText(to, plan);
     if (!whatsappResult.ok) {
       return NextResponse.json(
         {
@@ -311,7 +352,11 @@ async function handleCronRequest(request: Request) {
     });
   }
 
-  const whatsappResult = await sendWhatsAppDailyPlan(plan);
+  const to = process.env.WHATSAPP_RECIPIENT_PHONE;
+  if (!to) {
+    return NextResponse.json({ ok: false, error: "Missing WHATSAPP_RECIPIENT_PHONE" }, { status: 500 });
+  }
+  const whatsappResult = await sendWhatsAppText(to, plan);
   if (!whatsappResult.ok) {
     return NextResponse.json(
       {
